@@ -1,0 +1,1 @@
+Added ``max_body_size`` parameter to :class:`aiohttp.ClientSession` and per-request methods to cap the decoded response body size; exceeding it raises :class:`aiohttp.ClientBodySizeExceededError`, a :class:`aiohttp.ClientPayloadError` subclass, and closes the underlying connection instead of pooling it.

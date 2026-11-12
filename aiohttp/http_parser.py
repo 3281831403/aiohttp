@@ -22,6 +22,7 @@ from yarl import URL
 
 from . import hdrs
 from .base_protocol import BaseProtocol
+from .client_exceptions import ClientPayloadError
 from .compression_utils import (
     HAS_BROTLI,
     HAS_ZSTD,
@@ -280,6 +281,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         read_until_eof: bool = False,
         auto_decompress: bool = True,
         max_msg_queue_size: int = 0,
+        max_body_size: int | None = None,
     ) -> None:
         self.protocol = protocol
         self.loop = loop
@@ -302,6 +304,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         self._payload_has_more_data = False
         self._auto_decompress = auto_decompress
         self._limit = limit
+        self._max_body_size = max_body_size
         self._headers_parser = HeadersParser(max_field_size, self.lax)
         # Stop emitting messages once this many are queued unconsumed (0 = off).
         self._max_msg_queue_size = max_msg_queue_size
@@ -450,6 +453,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 timer=self.timer,
                                 loop=loop,
                                 limit=self._limit,
+                                max_body_size=self._max_body_size,
                             )
                             payload_parser = HttpPayloadParser(
                                 payload,
@@ -480,6 +484,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 timer=self.timer,
                                 loop=loop,
                                 limit=self._limit,
+                                max_body_size=self._max_body_size,
                             )
                             self._upgraded = True
                             self._payload_parser = HttpPayloadParser(
@@ -500,6 +505,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 timer=self.timer,
                                 loop=loop,
                                 limit=self._limit,
+                                max_body_size=self._max_body_size,
                             )
                             payload_parser = HttpPayloadParser(
                                 payload,
@@ -558,7 +564,12 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                     )
                 except Exception as underlying_exc:
                     reraised_exc: BaseException = underlying_exc
-                    if self.payload_exception is not None:
+                    # ClientPayloadError subclasses (e.g. body size errors) are
+                    # already user-facing payload errors; keep their type so
+                    # callers can distinguish them from generic truncation.
+                    if self.payload_exception is not None and not isinstance(
+                        underlying_exc, ClientPayloadError
+                    ):
                         reraised_exc = self.payload_exception(str(underlying_exc))
 
                     set_exception(

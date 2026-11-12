@@ -41,6 +41,7 @@ __all__ = (
     "WSServerHandshakeError",
     "ContentTypeError",
     "ClientPayloadError",
+    "ClientBodySizeExceededError",
     "UploadAbortedError",
     "InvalidURL",
     "InvalidUrlClientError",
@@ -260,6 +261,16 @@ class ServerFingerprintMismatch(ServerConnectionError):
 
 class ClientPayloadError(ClientError):
     """Response payload error."""
+
+
+class ClientBodySizeExceededError(ClientPayloadError):
+    """Response body exceeded the configured ``max_body_size`` limit.
+
+    The limit counts the decoded body bytes, so a compressed response is
+    measured after decompression when ``auto_decompress`` is enabled. The
+    underlying connection is always closed when this error is raised because
+    the remaining body bytes have not been consumed.
+    """
 
 
 class UploadAbortedError(ClientError):

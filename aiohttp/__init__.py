@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from . import hdrs
 from .client import (
     BaseConnector,
+    ClientBodySizeExceededError,
     ClientConnectionError,
     ClientConnectionResetError,
     ClientConnectorCertificateError,
@@ -130,6 +131,7 @@ __all__: tuple[str, ...] = (
     "ClientHttpProxyError",
     "ClientOSError",
     "ClientPayloadError",
+    "ClientBodySizeExceededError",
     "ClientProxyConnectionError",
     "ClientResponse",
     "ClientRequest",

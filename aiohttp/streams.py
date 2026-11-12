@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from typing import Final, Generic, TypeVar
 
 from .base_protocol import BaseProtocol
+from .client_exceptions import ClientBodySizeExceededError
 from .helpers import (
     _EXC_SENTINEL,
     DEFAULT_CHUNK_SIZE,
@@ -102,6 +103,7 @@ class StreamReader:
         "_eof_callbacks",
         "_eof_counter",
         "_on_chunk_received",
+        "_max_body_size",
         "total_bytes",
         "total_compressed_bytes",
     )
@@ -113,6 +115,7 @@ class StreamReader:
         *,
         timer: BaseTimerContext | None = None,
         loop: asyncio.AbstractEventLoop,
+        max_body_size: int | None = None,
     ) -> None:
         self._protocol = protocol
         self._low_water = limit
@@ -138,6 +141,7 @@ class StreamReader:
         self._on_chunk_received: (
             Callable[[bytes], Coroutine[None, None, None]] | None
         ) = None
+        self._max_body_size = max_body_size
         self.total_bytes = 0
         self.total_compressed_bytes: int | None = None
 
@@ -289,6 +293,24 @@ class StreamReader:
             return False
 
         data_len = len(data)
+        if (
+            self._max_body_size is not None
+            and self.total_bytes + data_len > self._max_body_size
+        ):
+            # The body is known to be incomplete at this point, so the
+            # connection can never be reused. Mark the payload failed and
+            # force the protocol closed instead of buffering the over-limit
+            # bytes; otherwise a fully-buffered (e.g. fast local) response
+            # could release the half-read connection back to the pool.
+            self.set_exception(
+                ClientBodySizeExceededError(
+                    f"Response body exceeds max_body_size of "
+                    f"{self._max_body_size} bytes"
+                )
+            )
+            self._protocol.force_close()
+            return False
+
         self._size += data_len
         self._buffer.append(data)
         self.total_bytes += data_len

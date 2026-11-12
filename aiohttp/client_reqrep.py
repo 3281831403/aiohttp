@@ -77,7 +77,7 @@ __all__ = ("ClientRequest", "ClientResponse", "RequestInfo", "Fingerprint")
 
 if TYPE_CHECKING:
     from .client import ClientSession
-    from .connector import Connection
+    from .connector import BaseConnector, Connection
     from .tracing import Trace
 
 
@@ -245,6 +245,7 @@ class ResponseParams(TypedDict):
     max_line_size: int
     max_field_size: int
     max_headers: int
+    max_body_size: int | None
 
 
 # Unflushed checkpoints kept before forcing a refresh in _add_bytes.
@@ -431,6 +432,8 @@ class ClientResponse(HeadersMixin):
     _upgraded: bool = False  # parser saw a Connection: upgrade token
 
     _connection: "Connection | None" = None  # current connection
+    _connector: "BaseConnector | None" = None
+    _connection_key: "ConnectionKey | None" = None
     _cookies: SimpleCookie | None = None
     _raw_cookie_headers: tuple[str, ...] | None = None
     _continue: asyncio.Future[bool] | None = None
@@ -705,6 +708,10 @@ class ClientResponse(HeadersMixin):
         self._closed = False
         self._protocol = connection.protocol
         self._connection = connection
+        # Keep references that survive connection release so a rejected
+        # body can still force the pooled connection closed.
+        self._connector = connection._connector
+        self._connection_key = connection._key
 
         with self._timer:
             while True:
@@ -782,6 +789,32 @@ class ClientResponse(HeadersMixin):
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+
+    def _force_close_pooled_connection(self) -> None:
+        """Close the response connection even if it was released to the pool.
+
+        Used when the body is rejected before being handed to the caller
+        (e.g. a ``max_body_size`` violation): such a connection must never
+        be reused, regardless of whether its payload was fully buffered.
+        """
+        connection = self._connection
+        if connection is not None:
+            connection.close()
+            self._connection = None
+            return
+        connector = self._connector
+        key = self._connection_key
+        protocol = self._protocol
+        if connector is None or key is None or protocol is None:
+            return
+        pool = connector._conns.get(key)
+        if pool is None:
+            return
+        for idx, (proto, _) in enumerate(pool):
+            if proto is protocol:
+                del pool[idx]
+                proto.close()
+                return
 
     def release(self) -> None:
         if not self._released:

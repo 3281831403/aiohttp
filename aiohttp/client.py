@@ -39,6 +39,7 @@ from . import hdrs, http, payload
 from ._websocket.reader import WebSocketDataQueue
 from .abc import AbstractCookieJar
 from .client_exceptions import (
+    ClientBodySizeExceededError,
     ClientConnectionError,
     ClientConnectionResetError,
     ClientConnectorCertificateError,
@@ -92,6 +93,7 @@ from .helpers import (
     _SENTINEL,
     DEFAULT_CHUNK_SIZE,
     EMPTY_BODY_METHODS,
+    EMPTY_BODY_STATUS_CODES,
     HTTP_AND_EMPTY_SCHEMA_SET,
     TimeoutHandle,
     _auth_header_from_netrc,
@@ -210,6 +212,7 @@ class _RequestOptions(TypedDict, total=False):
     max_line_size: int | None
     max_field_size: int | None
     max_headers: int | None
+    max_body_size: int | None
     middlewares: Sequence[ClientMiddlewareType] | None
     upload_tracker: UploadTracker | None
 
@@ -272,6 +275,7 @@ class _SessionOptions(TypedDict, total=False):
     max_line_size: int
     max_field_size: int
     max_headers: int
+    max_body_size: int | None
     fallback_charset_resolver: _CharsetResolver
     middlewares: Sequence[ClientMiddlewareType]
     ssl_shutdown_timeout: _SENTINEL | None | float
@@ -334,6 +338,7 @@ class ClientSession:
         "_max_line_size",
         "_max_field_size",
         "_max_headers",
+        "_max_body_size",
         "_resolve_charset",
         "_default_proxy",
         "_default_ssl",
@@ -369,6 +374,7 @@ class ClientSession:
         max_line_size: int = 8190,
         max_field_size: int = 8190,
         max_headers: int = 128,
+        max_body_size: int | None = None,
         fallback_charset_resolver: _CharsetResolver = lambda r, b: "utf-8",
         middlewares: Sequence[ClientMiddlewareType] = (),
         ssl_shutdown_timeout: _SENTINEL | None | float = sentinel,
@@ -445,6 +451,9 @@ class ClientSession:
         self._max_line_size = max_line_size
         self._max_field_size = max_field_size
         self._max_headers = max_headers
+        if max_body_size is not None and max_body_size < 0:
+            raise ValueError("max_body_size must be a non-negative integer or None")
+        self._max_body_size = max_body_size
 
         # Convert to list of tuples
         if headers:
@@ -543,6 +552,7 @@ class ClientSession:
         max_line_size: int | None = None,
         max_field_size: int | None = None,
         max_headers: int | None = None,
+        max_body_size: int | None | _SENTINEL = sentinel,
         middlewares: Sequence[ClientMiddlewareType] | None = None,
         upload_tracker: UploadTracker | None = None,
     ) -> ClientResponse:
@@ -654,6 +664,11 @@ class ClientSession:
             if max_headers is None:
                 max_headers = self._max_headers
 
+            if max_body_size is sentinel:
+                max_body_size = self._max_body_size
+            elif max_body_size is not None and max_body_size < 0:
+                raise ValueError("max_body_size must be a non-negative integer or None")
+
             for trace_config in self._trace_configs:
                 trace = Trace(
                     self,
@@ -746,6 +761,7 @@ class ClientSession:
                         "max_line_size": max_line_size,
                         "max_field_size": max_field_size,
                         "max_headers": max_headers,
+                        "max_body_size": max_body_size,
                     }
 
                     req = self._request_class(
@@ -816,6 +832,37 @@ class ClientSession:
                         if exc.errno is None and isinstance(exc, asyncio.TimeoutError):
                             raise
                         raise ClientOSError(*exc.args) from exc
+
+                    # Fail before handing the response to the caller when the
+                    # advertised body length provably exceeds the limit. Only
+                    # meaningful when the length is measured in the same units
+                    # as the limit: for a compressed response with
+                    # auto_decompress enabled the bytes are counted after
+                    # decompression, so the streaming check is authoritative.
+                    if (
+                        max_body_size is not None
+                        and method not in EMPTY_BODY_METHODS
+                        and resp.status not in EMPTY_BODY_STATUS_CODES
+                        and not (
+                            auto_decompress and resp.headers.get(hdrs.CONTENT_ENCODING)
+                        )
+                    ):
+                        content_length_hdr = resp.headers.get(hdrs.CONTENT_LENGTH)
+                        if (
+                            content_length_hdr is not None
+                            and int(content_length_hdr) > max_body_size
+                        ):
+                            # A small body may have been fully buffered already,
+                            # in which case start() released the (unread)
+                            # connection back to the pool. Force it closed in
+                            # either state so a rejected connection is never
+                            # reused by a subsequent request.
+                            resp._force_close_pooled_connection()
+                            resp.close()
+                            raise ClientBodySizeExceededError(
+                                f"Response content length {content_length_hdr} "
+                                f"exceeds max_body_size of {max_body_size} bytes"
+                            )
 
                     # Update cookies from raw headers to preserve duplicates
                     if resp._raw_cookie_headers:
@@ -1507,6 +1554,11 @@ class ClientSession:
     def auto_decompress(self) -> bool:
         """Should the body response be automatically decompressed."""
         return self._auto_decompress
+
+    @property
+    def max_body_size(self) -> int | None:
+        """Maximum number of decoded response body bytes, ``None`` for unlimited."""
+        return self._max_body_size
 
     @property
     def trust_env(self) -> bool:

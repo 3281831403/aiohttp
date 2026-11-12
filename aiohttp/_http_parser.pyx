@@ -17,6 +17,7 @@ from multidict import CIMultiDict as _CIMultiDict, istr as _istr
 from yarl import URL as _URL
 
 from aiohttp import hdrs
+from aiohttp.client_exceptions import ClientPayloadError
 from aiohttp.helpers import DEBUG, set_exception
 
 from .helpers import HeadersDictProxy as _HeadersDictProxy
@@ -362,6 +363,7 @@ cdef class HttpParser:
         object  _last_error
         bint    _auto_decompress
         int     _limit
+        object  _max_body_size
 
         str     _content_encoding
 
@@ -391,6 +393,7 @@ cdef class HttpParser:
         bint response_with_body=True, bint read_until_eof=False,
         bint auto_decompress=True,
         Py_ssize_t max_msg_queue_size=0,
+        object max_body_size=None,
     ):
         cparser.llhttp_settings_init(self._csettings)
         cparser.llhttp_init(self._cparser, mode, self._csettings)
@@ -444,6 +447,7 @@ cdef class HttpParser:
 
         self._last_error = None
         self._limit = limit
+        self._max_body_size = max_body_size
 
     cdef _process_header(self):
         cdef str value
@@ -561,7 +565,7 @@ cdef class HttpParser:
         ):
             payload = StreamReader(
                 self.protocol, timer=self._timer, loop=self._loop,
-                limit=self._limit)
+                limit=self._limit, max_body_size=self._max_body_size)
         else:
             payload = EMPTY_PAYLOAD
 
@@ -750,11 +754,12 @@ cdef class HttpRequestParser(HttpParser):
         size_t max_field_size=8190, payload_exception=None,
         bint response_with_body=True, bint read_until_eof=False,
         bint auto_decompress=True, Py_ssize_t max_msg_queue_size=0,
+        object max_body_size=None,
     ):
         self._init(cparser.HTTP_REQUEST, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress, max_msg_queue_size)
+                   auto_decompress, max_msg_queue_size, max_body_size)
 
     cdef object _on_status_complete(self):
         cdef int idx1, idx2
@@ -836,12 +841,13 @@ cdef class HttpResponseParser(HttpParser):
             size_t max_line_size=8190, size_t max_headers=128,
             size_t max_field_size=8190, payload_exception=None,
             bint response_with_body=True, bint read_until_eof=False,
-            bint auto_decompress=True
+            bint auto_decompress=True, object max_body_size=None
     ):
         self._init(cparser.HTTP_RESPONSE, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress)
+                   auto_decompress, max_msg_queue_size=0,
+                   max_body_size=max_body_size)
         # Use strict parsing on dev mode, so users are warned about broken servers.
         if not DEBUG:
             cparser.llhttp_set_lenient_headers(self._cparser, 1)
@@ -958,7 +964,12 @@ cdef int cb_on_body(cparser.llhttp_t* parser,
             pyparser._more_data_available = pyparser._payload.feed_data(body)
         except BaseException as underlying_exc:
             reraised_exc = underlying_exc
-            if pyparser._payload_exception is not None:
+            # Keep ClientPayloadError subclasses (e.g. body size errors) intact
+            # so callers can distinguish them from generic payload truncation.
+            if (
+                pyparser._payload_exception is not None
+                and not isinstance(underlying_exc, ClientPayloadError)
+            ):
                 reraised_exc = pyparser._payload_exception(str(underlying_exc))
 
             set_exception(pyparser._payload, reraised_exc, underlying_exc)

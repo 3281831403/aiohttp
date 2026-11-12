@@ -73,6 +73,15 @@ class BaseProtocol(asyncio.Protocol):
             self._parser.pause_reading()
         self._pause_transport_reading()
 
+    def force_close(self) -> None:
+        """Mark the connection as non-reusable.
+
+        Subclasses that own a keep-alive pool override this to also flip
+        their own close flag (e.g. :class:`ResponseHandler`).
+        """
+        if self.transport is not None:
+            self.transport.close()
+
     def _pause_reading_for_buffer(self) -> None:
         """Hold the transport for a buffer this protocol cannot drain yet.
 

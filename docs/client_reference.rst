@@ -59,6 +59,7 @@ The client session supports the context manager protocol for self closing.
                          max_line_size=8190, \
                          max_field_size=8190, \
                          max_headers=128, \
+                         max_body_size=None, \
                          fallback_charset_resolver=lambda r, b: "utf-8", \
                          ssl_shutdown_timeout=0)
    :canonical: aiohttp.client.ClientSession
@@ -242,6 +243,20 @@ The client session supports the context manager protocol for self closing.
 
    :param int max_headers: Maximum number of headers and trailers combined in responses.
 
+   :param int max_body_size: Maximum allowed size of a response body in bytes,
+      or ``None`` for no limit (the default). The size is measured on the
+      decoded body, so with :attr:`ClientSession.auto_decompress` enabled a
+      compressed response is counted after decompression. When the limit is
+      exceeded while reading the body,
+      :class:`aiohttp.ClientBodySizeExceededError` is raised and the
+      underlying connection is closed instead of being returned to the
+      connection pool. If a response advertises a ``Content-Length`` that
+      already exceeds the limit (and the length is measured in the same
+      units as the limit), the request fails before the response is
+      returned. Can be overridden per request.
+
+      .. versionadded:: 4.0
+
    :param Callable[[ClientResponse,bytes],str] fallback_charset_resolver:
       A :term:`callable` that accepts a :class:`ClientResponse` and the
       :class:`bytes` contents, and returns a :class:`str` which will be used as
@@ -376,6 +391,15 @@ The client session supports the context manager protocol for self closing.
 
       .. versionadded:: 3.7
 
+   .. attribute:: max_body_size
+
+      Maximum allowed size of a decoded response body in bytes,
+      or ``None`` for no limit.
+
+      :class:`int` or ``None``, default is ``None``
+
+      .. versionadded:: 4.0
+
    .. attribute:: trust_env
 
       Trust environment settings for proxy configuration
@@ -410,7 +434,8 @@ The client session supports the context manager protocol for self closing.
                          auto_decompress=None, \
                          max_line_size=None, \
                          max_field_size=None, \
-                         max_headers=None)
+                         max_headers=None, \
+                         max_body_size=sentinel)
       :async:
       :noindexentry:
 
@@ -586,6 +611,13 @@ The client session supports the context manager protocol for self closing.
       :param int max_field_size: Maximum allowed size of header name and value combined in responses.
 
       :param int max_headers: Maximum number of headers and trailers combined in responses.
+
+      :param int max_body_size: Maximum allowed size of the decoded response
+         body in bytes. Overrides :attr:`ClientSession.max_body_size`; pass
+         ``None`` to disable the limit for this request. Exceeding it raises
+         :class:`aiohttp.ClientBodySizeExceededError`.
+
+         .. versionadded:: 4.0
 
       :return ClientResponse: a :class:`client response <ClientResponse>`
          object.
@@ -916,6 +948,7 @@ certification chaining.
                         max_line_size=None, \
                         max_field_size=None, \
                         max_headers=None, \
+                        max_body_size=sentinel, \
                         version=aiohttp.HttpVersion11, \
                         connector=None)
    :canonical: aiohttp.client.request
@@ -1056,6 +1089,12 @@ certification chaining.
    :param int max_field_size: Maximum allowed size of header name and value combined in responses.
 
    :param int max_headers: Maximum number of headers and trailers combined in responses.
+
+   :param int max_body_size: Maximum allowed size of the decoded response
+      body in bytes, or ``None`` for no limit. Exceeding it raises
+      :class:`aiohttp.ClientBodySizeExceededError`.
+
+      .. versionadded:: 4.0
 
    :param aiohttp.protocol.HttpVersion version: Request HTTP version,
       ``HTTP 1.1`` by default. (optional)
@@ -2828,6 +2867,18 @@ All exceptions are available as members of *aiohttp* module.
    3. not enough data that satisfy ``Content-Length`` HTTP header.
 
    Derived from :exc:`ClientError`
+
+.. class:: ClientBodySizeExceededError
+   :canonical: aiohttp.client_exceptions.ClientBodySizeExceededError
+
+   The response body exceeded the configured
+   :attr:`ClientSession.max_body_size` limit, measured in decoded bytes.
+   Raised either before the response is returned (when an advertised
+   ``Content-Length`` already exceeds the limit) or while streaming the
+   body. The underlying connection is closed when this happens, so it is
+   not returned to the connection pool.
+
+   Derived from :exc:`ClientPayloadError`
 
 .. class:: UploadAbortedError
    :canonical: aiohttp.client_exceptions.UploadAbortedError

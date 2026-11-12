@@ -3,6 +3,7 @@ from __future__ import annotations  # TODO(PY314): Remove
 
 import asyncio
 import datetime
+import gzip
 import http.cookies
 import io
 import json
@@ -47,6 +48,7 @@ import aiohttp
 from aiohttp import Fingerprint, ServerFingerprintMismatch, hdrs, payload, web
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client_exceptions import (
+    ClientBodySizeExceededError,
     ClientResponseError,
     InvalidURL,
     InvalidUrlClientError,
@@ -6971,3 +6973,321 @@ async def test_deprecated_upload_attributes(aiohttp_client: AiohttpClient) -> No
         with pytest.warns(DeprecationWarning, match="output_size is deprecated"):
             assert resp.output_size >= 1024
         await resp.read()
+
+
+class TestMaxBodySize:
+    @pytest.fixture
+    def large_body(self) -> bytes:
+        return b"x" * 4096
+
+    async def test_session_default_unlimited(
+        self, aiohttp_client: AiohttpClient, large_body: bytes
+    ) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=large_body)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app)
+
+        async with client.get("/") as resp:
+            assert await resp.read() == large_body
+
+    async def test_under_limit_unchanged(
+        self, aiohttp_client: AiohttpClient, large_body: bytes
+    ) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=large_body)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app, max_body_size=len(large_body))
+
+        async with client.get("/") as resp:
+            # Exactly the limit is allowed.
+            assert await resp.read() == large_body
+
+    async def test_content_length_exceeds_before_response(
+        self, aiohttp_client: AiohttpClient, large_body: bytes
+    ) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=large_body)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app, max_body_size=len(large_body) - 1)
+
+        with pytest.raises(ClientBodySizeExceededError):
+            await client.get("/")
+
+    async def test_per_request_override(
+        self, aiohttp_client: AiohttpClient, large_body: bytes
+    ) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=large_body)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app, max_body_size=len(large_body) * 10)
+
+        # Tighter per-request limit wins and fails before the response.
+        with pytest.raises(ClientBodySizeExceededError):
+            await client.get("/", max_body_size=16)
+
+        # The session default still applies on the next request.
+        async with client.get("/") as resp:
+            assert await resp.read() == large_body
+
+    async def test_per_request_none_disables_limit(
+        self, aiohttp_client: AiohttpClient, large_body: bytes
+    ) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=large_body)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app, max_body_size=1)
+
+        async with client.get("/", max_body_size=None) as resp:
+            assert await resp.read() == large_body
+
+    async def test_head_not_limited(
+        self, aiohttp_client: AiohttpClient, large_body: bytes
+    ) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=large_body)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app, max_body_size=1)
+
+        async with client.head("/") as resp:
+            assert resp.status == 200
+            assert await resp.read() == b""
+
+    async def test_304_not_limited(self, aiohttp_client: AiohttpClient) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(status=304)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app, max_body_size=1)
+
+        async with client.get("/") as resp:
+            assert resp.status == 304
+
+    async def test_streaming_body_exceeds(
+        self, aiohttp_client: AiohttpClient, large_body: bytes
+    ) -> None:
+        async def handler(request: web.Request) -> web.StreamResponse:
+            response = web.StreamResponse()
+            await response.prepare(request)
+            for _ in range(4):
+                await response.write(b"x" * 1024)
+            return response
+
+        app = web.Application()
+        app.router.add_post("/", handler)
+        client = await aiohttp_client(app, max_body_size=2048)
+
+        async with client.post("/") as resp:
+            assert isinstance(resp, aiohttp.ClientResponse)
+            with pytest.raises(ClientBodySizeExceededError):
+                await resp.read()
+            # The error type stays distinguishable from generic truncation.
+            with pytest.raises(aiohttp.ClientPayloadError):
+                await resp.content.read()
+
+    async def test_gzip_bomb_measured_after_decompression(self) -> None:
+        decoded = b"0" * 8192
+        encoded = gzip.compress(decoded)
+        assert len(encoded) < len(decoded)
+
+        async def serve(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                await reader.readline()
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/octet-stream\r\n"
+                    b"Content-Encoding: gzip\r\n"
+                    b"Content-Length: " + str(len(encoded)).encode() + b"\r\n"
+                    b"Connection: close\r\n\r\n" + encoded
+                )
+                writer.write(response)
+                await writer.drain()
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            # Compressed length is below the limit, decoded length is above:
+            # the streaming decompressed check must still fire.
+            async with aiohttp.ClientSession(max_body_size=len(encoded) * 2) as session:
+                resp = await session.get(f"http://127.0.0.1:{port}/")
+                try:
+                    with pytest.raises(ClientBodySizeExceededError):
+                        await resp.read()
+                finally:
+                    resp.release()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_gzip_disabled_decompress_counts_wire_bytes(self) -> None:
+        decoded = b"0" * 8192
+        encoded = gzip.compress(decoded)
+
+        async def serve(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                await reader.readline()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/octet-stream\r\n"
+                    b"Content-Encoding: gzip\r\n"
+                    b"Content-Length: " + str(len(encoded)).encode() + b"\r\n"
+                    b"Connection: close\r\n\r\n" + encoded
+                )
+                await writer.drain()
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            async with aiohttp.ClientSession(
+                auto_decompress=False, max_body_size=len(encoded) - 1
+            ) as session:
+                with pytest.raises(ClientBodySizeExceededError):
+                    await session.get(f"http://127.0.0.1:{port}/")
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_chunked_body_exceeds(self) -> None:
+        chunks = [b"x" * 1024 for _ in range(4)]
+
+        async def serve(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                await reader.readline()
+                writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                for chunk in chunks:
+                    writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                writer.write(b"0\r\n\r\n")
+                await writer.drain()
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            async with aiohttp.ClientSession(max_body_size=2048) as session:
+                resp = await session.get(f"http://127.0.0.1:{port}/")
+                try:
+                    with pytest.raises(ClientBodySizeExceededError):
+                        await resp.read()
+                finally:
+                    resp.release()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_streaming_iter_frees_connection_slot(self) -> None:
+        chunks = [b"x" * 1024 for _ in range(8)]
+
+        async def serve(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                await reader.readline()
+                writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                for chunk in chunks:
+                    writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                    try:
+                        await writer.drain()
+                    except (ConnectionResetError, BrokenPipeError):
+                        return
+                writer.write(b"0\r\n\r\n")
+                await writer.drain()
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            connector = aiohttp.TCPConnector(limit=1)
+            async with aiohttp.ClientSession(
+                connector=connector, max_body_size=2048
+            ) as session:
+                resp = await session.get(f"http://127.0.0.1:{port}/")
+                received = 0
+                try:
+                    with pytest.raises(ClientBodySizeExceededError):
+                        async for chunk in resp.content.iter_any():
+                            received += len(chunk)
+                finally:
+                    # Fails as soon as the limit is crossed, not at EOF.
+                    assert received <= 2048
+                    resp.release()
+
+                # The failed connection is closed, not pooled, and its single
+                # connector slot is released.
+                assert all(not pool for pool in connector._conns.values())
+                assert not connector._acquired
+
+                # A follow-up request can acquire the (only) connection slot.
+                resp2 = await session.get(f"http://127.0.0.1:{port}/")
+                try:
+                    with pytest.raises(ClientBodySizeExceededError):
+                        await resp2.read()
+                finally:
+                    resp2.release()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_connection_not_reused_after_limit_error(
+        self, aiohttp_client: AiohttpClient
+    ) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=b"x" * 4096)
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        connector = aiohttp.TCPConnector(limit=1)
+        client = await aiohttp_client(app, connector=connector, max_body_size=1024)
+
+        for _ in range(2):
+            with pytest.raises(ClientBodySizeExceededError):
+                await client.get("/")
+            # The half-read connection must be closed, not pooled.
+            assert all(not pool for pool in connector._conns.values())
+            assert not connector._acquired
+
+        # The single connection slot is released: subsequent requests proceed
+        # instead of deadlocking on limit=1.
+        client_2 = await aiohttp_client(app, connector=connector)
+        async with client_2.get("/") as resp:
+            assert resp.status == 200
+            assert len(await resp.read()) == 4096
+
+    async def test_invalid_session_limit(self) -> None:
+        with pytest.raises(ValueError, match="max_body_size"):
+            aiohttp.ClientSession(max_body_size=-1)
+
+    async def test_invalid_request_limit(self, aiohttp_client: AiohttpClient) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(body=b"ok")
+
+        app = web.Application()
+        app.router.add_get("/", handler)
+        client = await aiohttp_client(app)
+
+        with pytest.raises(ValueError, match="max_body_size"):
+            await client.get("/", max_body_size=-5)
